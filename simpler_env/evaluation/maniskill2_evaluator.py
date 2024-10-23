@@ -3,13 +3,94 @@ Evaluate a model on ManiSkill2 environment.
 """
 
 import os
-
+import sys
 import numpy as np
 from transforms3d.euler import quat2euler
 
 from simpler_env.utils.env.env_builder import build_maniskill2_env, get_robot_control_mode
 from simpler_env.utils.env.observation_utils import get_image_from_maniskill2_obs_dict
 from simpler_env.utils.visualization import write_video
+
+def stage1_subgoal_constraint1(end_effector, keypoints):
+    """Align end-effector with the carrot's center."""
+    carrot_center = keypoints[0]  # Assuming keypoint[0] is carrot center
+    path_cost = np.linalg.norm(end_effector - carrot_center)
+    return path_cost
+
+def stage1_collision_constraint1(end_effector, keypoints):
+    """Ensure the end-effector approaches from above."""
+    carrot_center = keypoints[0]
+    # Check if the z-coordinate of the end-effector is higher than the carrot's z-coordinate
+    collision_cost = 0 if end_effector[2] > carrot_center[2] else 1  # Penalize if below the carrot
+    return collision_cost
+
+def stage1_grasp_constraint(grasp_status, is_src_obj_grasped):
+    """Grasp the carrot."""
+    grasp_cost = 0 if is_src_obj_grasped else 1  # Grasp cost is incurred when the carrot is grasped
+    return grasp_cost
+
+
+### Stage 2: Move carrot to plate
+# The carrot must stay grasped and avoid collisions.
+def stage2_grasp_constraint(grasp_status, is_src_obj_grasped, src_on_target):
+    """Ensure the carrot remains grasped during the move."""
+    grasp_cost = 0 if is_src_obj_grasped else 1  # Carrot must remain grasped
+    return grasp_cost
+
+def stage2_collision_constraint(end_effector, keypoints):
+    """Ensure the carrot is aligned above the plate."""
+    carrot_center = keypoints[0]
+    plate_center = keypoints[1]  # Assuming keypoint[1] is the plate center
+    collision_cost = np.linalg.norm(carrot_center[:2] - plate_center[:2])  # Only consider x and y axes
+    return collision_cost
+
+
+### Stage 3: Drop carrot on plate
+# Ensure the carrot is placed on the plate and avoid collision.
+def stage3_path_constraint(end_effector, keypoints):
+    """Place the carrot on the plate."""
+    carrot_center = keypoints[0]
+    plate_center = keypoints[1]
+    path_cost = np.linalg.norm(carrot_center - plate_center)  # Ensure carrot is on the plate center
+    return path_cost
+
+def stage3_collision_constraint(end_effector, keypoints):
+    """Ensure end-effector moves away after placing the carrot."""
+    carrot_center = keypoints[0]
+    # Check if the end-effector moves above and away after placing
+    collision_cost = 0 if end_effector[2] > carrot_center[2] else 1
+    return collision_cost
+    
+
+def cal_cost(end_effector, keypoints, stage, info):
+
+    cost={}
+    grasp_status=info['is_src_obj_grasped']
+    is_src_obj_grasped=info['is_src_obj_grasped']
+    src_on_target=info['src_on_target']
+
+    if(stage==1):
+      cost['path_cost']=stage1_subgoal_constraint1(end_effector, keypoints)
+      cost['col_cost']=stage1_collision_constraint1(end_effector, keypoints)
+      cost['grasp_cost']=stage1_grasp_constraint(grasp_status, is_src_obj_grasped)
+
+
+    elif(stage==2):
+      cost['grasp_cost']=stage2_grasp_constraint(grasp_status, is_src_obj_grasped, src_on_target)
+      cost['col_cost']=stage2_collision_constraint(end_effector, keypoints)
+
+
+    elif(stage==3):
+      cost['path_cost']=stage3_path_constraint(end_effector, keypoints)
+      cost['col_cost']=stage3_collision_constraint(end_effector, keypoints)
+    print(cost)
+    cost_sum=0
+    for k,v in cost.items():
+      cost_sum+=v
+    return cost_sum,cost
+
+
+
 
 
 def run_maniskill2_eval_single_episode(
@@ -36,7 +117,6 @@ def run_maniskill2_eval_single_episode(
     additional_env_save_tags=None,
     logging_dir="./results",
 ):
-
     if additional_env_build_kwargs is None:
         additional_env_build_kwargs = {}
 
@@ -82,16 +162,19 @@ def run_maniskill2_eval_single_episode(
         env_reset_options["obj_init_options"] = {
             "episode_id": obj_episode_id,
         }
-    obs, _ = env.reset(options=env_reset_options)
+    obs, reset_info = env.reset(options=env_reset_options)
+    print("obs:",obs['agent']['controller']['arm'])
+    print("reset_source",reset_info['episode_source_obj_init_pose_wrt_robot_base'])
+    print('reset_target',reset_info['episode_target_obj_init_pose_wrt_robot_base'])
     # for long-horizon environments, we check if the current subtask is the final subtask
-    is_final_subtask = env.is_final_subtask() 
+    is_final_subtask = env.unwrapped.is_final_subtask() 
 
     # Obtain language instruction
     if instruction is not None:
         task_description = instruction
     else:
         # get default language instruction
-        task_description = env.get_language_instruction()
+        task_description = env.unwrapped.get_language_instruction()
     print(task_description)
 
     # Initialize logging
@@ -105,7 +188,14 @@ def run_maniskill2_eval_single_episode(
 
     timestep = 0
     success = "failure"
-
+    success_time=0
+    stage=1
+    cost=0
+    cost_sum_dict={
+      'col_cost': 0,
+      'grasp_cost': 0,
+      'path_cost': 0,
+    }
     # Step the environment
     while not (predicted_terminated or truncated):
         # step the model; "raw_action" is raw model action output; "action" is the processed action to be sent into maniskill env
@@ -116,28 +206,55 @@ def run_maniskill2_eval_single_episode(
             if not is_final_subtask:
                 # advance the environment to the next subtask
                 predicted_terminated = False
-                env.advance_to_next_subtask()
+                env.unwrapped.advance_to_next_subtask()
 
         # step the environment
         obs, reward, done, truncated, info = env.step(
             np.concatenate([action["world_vector"], action["rot_axangle"], action["gripper"]]),
         )
         
+        print("obs:",obs['agent']['controller']['arm'])
+        print("reset_source",reset_info['episode_source_obj_init_pose_wrt_robot_base'])
+        print('reset_target',reset_info['episode_target_obj_init_pose_wrt_robot_base'])
+        obs_pose=obs['agent']['controller']['arm']['target_pose'][:3]
+        source_pose=reset_info['episode_source_obj_init_pose_wrt_robot_base']
+        tar_pose=reset_info['episode_target_obj_init_pose_wrt_robot_base']
+        if(info["moved_correct_obj"]==False):
+            stage=1    
+
+        elif(info["moved_correct_obj"]==True and info['is_src_obj_grasped']==True):
+            stage=2
+
+        elif(info['is_src_obj_grasped']==True and info['consecutive_grasp']==True and info["src_on_target"]== False):
+            stage=3
+        keypoints=[np.array(source_pose.p),np.array(tar_pose.p)]
+        print(obs_pose,keypoints)
+        cost_step,cost_dict=cal_cost(end_effector=obs_pose,keypoints=keypoints,stage=stage,info=info)
+        cost+=cost_step
+        for k,v in cost_dict.items():
+          cost_sum_dict[k]+=v
         success = "success" if done else "failure"
-        new_task_description = env.get_language_instruction()
+        if info['success']==True:
+          success_time +=1
+          print(success_time)
+          #print(obs)
+          print(timestep,info)
+        new_task_description = env.unwrapped.get_language_instruction()
         if new_task_description != task_description:
             task_description = new_task_description
             print(task_description)
-        is_final_subtask = env.is_final_subtask()
+        is_final_subtask = env.unwrapped.is_final_subtask()
 
         print(timestep, info)
-
+        if success_time>=3:
+          break
         image = get_image_from_maniskill2_obs_dict(env, obs, camera_name=obs_camera_name)
         images.append(image)
         timestep += 1
 
     episode_stats = info.get("episode_stats", {})
-
+    print("cost:",cost)
+    print(cost_sum_dict)
     # save video
     env_save_name = env_name
     for k, v in additional_env_build_kwargs.items():
@@ -152,6 +269,10 @@ def run_maniskill2_eval_single_episode(
         video_name = f"{success}_obj_episode_{obj_episode_id}"
     for k, v in episode_stats.items():
         video_name = video_name + f"_{k}_{v}"
+    cost_int=int(cost)
+    for k,v in cost_sum_dict.items():
+        video_name+=f'{k}_{v}_'
+    video_name=video_name+f"cost_{cost_int}"
     video_name = video_name + ".mp4"
     if rgb_overlay_path is not None:
         rgb_overlay_path_str = os.path.splitext(os.path.basename(rgb_overlay_path))[0]
