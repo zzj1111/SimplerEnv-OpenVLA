@@ -23,7 +23,7 @@ class OpenVLAInference:
     ) -> None:
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
         if policy_setup == "widowx_bridge":
-            unnorm_key = "bridge_orig" if unnorm_key is None else unnorm_key
+            unnorm_key = "Simpler" if unnorm_key is None else unnorm_key
             self.sticky_gripper_num_repeat = 1
         elif policy_setup == "google_robot":
             unnorm_key = "fractal20220817_data" if unnorm_key is None else unnorm_key
